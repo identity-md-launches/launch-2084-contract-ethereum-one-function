@@ -58,6 +58,12 @@ contract WebsiteBuyerHandler is Test {
     uint256 public results;
     uint256 public failures;
     uint256 public undelivered;
+    uint256 public minimumBuys;
+
+    // When set, _attempt goes through buyWebsiteWithMinimum with these bounds.
+    bool internal _withMinimum;
+    uint256 internal _minSurplus;
+    uint256 internal _deadline;
 
     constructor(
         WebsiteBuyer buyer_,
@@ -123,6 +129,46 @@ contract WebsiteBuyerHandler is Test {
         _attempt(actor, eth, words, expected, out, price);
     }
 
+    /// @dev The slippage-bounded entry: same custody rules, plus a surplus floor and a deadline.
+    function buyWithMinimum(
+        uint256 actorSeed,
+        uint256 ethSeed,
+        uint256 outSeed,
+        uint256 minSeed,
+        uint256 deadlineSeed,
+        uint256 wordSeed
+    ) external {
+        address actor = actors[actorSeed % actors.length];
+        uint256 eth = bound(ethSeed, 1, 10 ether);
+        uint128 out = uint128(bound(outSeed, 0.5 ether, 5 ether));
+        uint256 price = 0.5 ether;
+        manager.configure(out, 10_000);
+        current.setPrice(JOB_OPEN, IMD, price);
+        uint256 surplus = out - price;
+        // Around the actual surplus, so both sides of the floor are hit, including equality.
+        uint256 minSurplus = bound(minSeed, surplus > 2 ? surplus - 2 : 0, surplus + 2);
+        if (minSeed % 4 == 0) minSurplus = surplus;
+        // Deadline: one second in the past, exactly now, or later.
+        uint256 deadline = block.timestamp - 1 + bound(deadlineSeed, 0, 2);
+
+        bytes memory expected;
+        if (buyer.paused()) {
+            expected = abi.encodeWithSelector(Pausable.EnforcedPause.selector);
+        } else if (deadline < block.timestamp) {
+            expected = abi.encodeWithSelector(WebsiteBuyer.Expired.selector, deadline);
+        } else if (surplus < minSurplus) {
+            expected = abi.encodeWithSelector(WebsiteBuyer.SurplusTooLow.selector, surplus, minSurplus);
+        }
+
+        _withMinimum = true;
+        _minSurplus = minSurplus;
+        _deadline = deadline;
+        uint256 okBefore = okBuys;
+        _attempt(actor, eth, _words(wordSeed), expected, out, price);
+        if (okBuys != okBefore) ++minimumBuys;
+        _withMinimum = false;
+    }
+
     function buyPartialFill(uint256 actorSeed, uint256 ethSeed, uint16 fillSeed) external {
         address actor = actors[actorSeed % actors.length];
         uint256 eth = bound(ethSeed, 2, 10 ether);
@@ -169,14 +215,15 @@ contract WebsiteBuyerHandler is Test {
         Ghost storage g = _ghosts[id];
         if (g.completedAtIntake) return;
         bytes32 hash = keccak256(abi.encode(hashSeed));
-        string memory uri = _uri(uint256(uriLen) % 97);
+        // Up to 255 bytes: URIs over the stored cap are emitted but must not block settlement.
+        string memory uri = _uri(uriLen);
         vm.prank(writer);
         bool delivered = MockIntake(g.intake).complete(id, 0, abi.encode(id, hash, uri));
         g.completedAtIntake = true;
         assertTrue(delivered, "pending result must be delivered within the stipend");
         g.state = uint8(WebsiteBuyer.State.Done);
         g.resultHash = hash;
-        g.uriHash = keccak256(bytes(uri));
+        g.uriHash = keccak256(bytes(uriLen <= buyer.MAX_STORED_URI_BYTES() ? uri : ""));
         ++results;
     }
 
@@ -185,20 +232,22 @@ contract WebsiteBuyerHandler is Test {
         bytes32 id = ids[idSeed % ids.length];
         Ghost storage g = _ghosts[id];
         if (g.completedAtIntake) return;
-        // Mostly 1 or 2; sometimes a status the contract must refuse, which the Intake records undelivered.
-        uint8 status = statusSeed % 5 == 4 ? uint8(bound(statusSeed, 3, 255)) : uint8(statusSeed % 2 + 1);
+        // Mostly 1 or 2; sometimes a later nonzero status (recorded), sometimes 0 (refused by the
+        // contract, which the Intake records undelivered).
+        uint8 pick = statusSeed % 6;
+        uint8 status = pick == 5 ? 0 : pick == 4 ? uint8(bound(statusSeed, 3, 255)) : pick % 2 + 1;
         vm.prank(writer);
         bool delivered =
-            MockIntake(g.intake).complete(id, status, abi.encode(id, status, reason, uint16(0), uint16(0), bytes("")));
+            MockIntake(g.intake).complete(id, 1, abi.encode(id, status, reason, uint16(0), uint16(0), bytes("")));
         g.completedAtIntake = true;
-        if (status == 1 || status == 2) {
+        if (status != 0) {
             assertTrue(delivered, "pending failure must be delivered");
             g.state = uint8(WebsiteBuyer.State.Failed);
             g.status = status;
             g.reason = reason;
             ++failures;
         } else {
-            assertFalse(delivered, "unknown status must not settle");
+            assertFalse(delivered, "status 0 on the failure path must not settle");
             ++undelivered;
         }
     }
@@ -318,36 +367,54 @@ contract WebsiteBuyerHandler is Test {
         uint128 out,
         uint256 price
     ) internal {
-        uint256 actorEth = actor.balance;
-        uint256 actorImd = imd.balanceOf(actor);
-        uint256 treasuryImd = imd.balanceOf(treasury);
+        uint256[3] memory before = [actor.balance, imd.balanceOf(actor), imd.balanceOf(treasury)];
         address accountBefore = address(buyer.accountOf(actor));
         MockIntake used = current;
 
-        vm.prank(actor);
-        try buyer.buyWebsite{value: eth}(words) returns (bytes32 id) {
+        (bool ok, bytes32 id, bytes memory err) = _send(actor, eth, words);
+        if (ok) {
             assertEq(expected.length, 0, "purchase that must revert succeeded");
             assertEq(_ghosts[id].buyer, address(0), "request id reused");
             ghostEthIn += eth;
             ethSpent[actor] += eth;
             ghostPricePaid += price;
             surplusOf[actor] += out - price;
-            address account = address(buyer.accountOf(actor));
-            if (firstAccount[actor] == address(0)) firstAccount[actor] = account;
+            if (firstAccount[actor] == address(0)) firstAccount[actor] = address(buyer.accountOf(actor));
             ids.push(id);
             _ghosts[id] =
                 Ghost(actor, address(used), price, uint8(WebsiteBuyer.State.Pending), 0, 0, 0, keccak256(""), false);
             // The body that reached the Intake is exactly the preview, with no owner field.
             assertEq(used.requestOf(id).body, buyer.bodyOf(words));
             ++okBuys;
-        } catch (bytes memory err) {
+        } else {
             assertGt(expected.length, 0, "valid purchase reverted");
             assertEq(err, expected, "wrong revert reason");
-            assertEq(actor.balance, actorEth, "refused purchase kept ETH");
-            assertEq(imd.balanceOf(actor), actorImd, "refused purchase moved IMD");
-            assertEq(imd.balanceOf(treasury), treasuryImd, "refused purchase paid the Intake");
+            assertEq(actor.balance, before[0], "refused purchase kept ETH");
+            assertEq(imd.balanceOf(actor), before[1], "refused purchase moved IMD");
+            assertEq(imd.balanceOf(treasury), before[2], "refused purchase paid the Intake");
             assertEq(address(buyer.accountOf(actor)), accountBefore, "refused purchase opened an account");
             ++refusedBuys;
+        }
+    }
+
+    /// @dev One purchase through the entry point chosen by _withMinimum, as the actor.
+    function _send(address actor, uint256 eth, string memory words)
+        internal
+        returns (bool ok, bytes32 id, bytes memory err)
+    {
+        vm.prank(actor);
+        if (_withMinimum) {
+            try buyer.buyWebsiteWithMinimum{value: eth}(words, _minSurplus, _deadline) returns (bytes32 r) {
+                (ok, id) = (true, r);
+            } catch (bytes memory e) {
+                err = e;
+            }
+        } else {
+            try buyer.buyWebsite{value: eth}(words) returns (bytes32 r) {
+                (ok, id) = (true, r);
+            } catch (bytes memory e) {
+                err = e;
+            }
         }
     }
 
@@ -402,7 +469,7 @@ contract WebsiteBuyerInvariantTest is Test {
         buyer = new WebsiteBuyer(OWNER);
         handler = new WebsiteBuyerHandler(buyer, imd, manager, MockIntake(INTAKE), OWNER, writer, treasury);
 
-        bytes4[] memory selectors = new bytes4[](13);
+        bytes4[] memory selectors = new bytes4[](14);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.buy.selector; // weighted: purchases drive the state the others act on
         selectors[2] = handler.buyPartialFill.selector;
@@ -416,6 +483,7 @@ contract WebsiteBuyerInvariantTest is Test {
         selectors[10] = handler.outsiderAdmin.selector;
         selectors[11] = handler.donateIMD.selector;
         selectors[12] = handler.donateETH.selector;
+        selectors[13] = handler.buyWithMinimum.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }

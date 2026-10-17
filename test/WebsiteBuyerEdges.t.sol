@@ -95,14 +95,50 @@ contract WebsiteBuyerEdgesTest is WebsiteBuyerBase {
     }
 
     /// forge-config: default.fuzz.runs = 256
-    function testFuzz_resultURIUpTo192BytesIsDelivered(uint8 lenSeed, bytes32 hash) public {
-        uint256 len = bound(lenSeed, 0, 192);
+    function testFuzz_resultURIIsDeliveredStoredUpToCapAndAlwaysEmitted(uint8 lenSeed, bytes32 hash) public {
+        uint256 len = bound(lenSeed, 0, 255);
         bytes32 id = _buy(alice);
         string memory uri = _repeat(len, "u");
+        vm.expectEmit(true, true, false, true, address(buyer));
+        emit WebsiteBuyer.WebsiteResult(id, alice, hash, uri);
         vm.prank(writer);
         assertTrue(intake.complete(id, 0, abi.encode(id, hash, uri)));
-        assertEq(buyer.requestOf(id).uri, uri);
-        assertEq(buyer.requestOf(id).resultHash, hash);
+        WebsiteBuyer.Request memory request = buyer.requestOf(id);
+        assertEq(uint8(request.state), uint8(WebsiteBuyer.State.Done));
+        assertEq(request.resultHash, hash);
+        assertEq(request.uri, len <= buyer.MAX_STORED_URI_BYTES() ? uri : "");
+    }
+
+    function test_resultURIStorageCapBoundary() public {
+        uint256 cap = buyer.MAX_STORED_URI_BYTES();
+        assertEq(cap, 128);
+        bytes32 a = _buy(alice);
+        bytes32 b = _buy(bob);
+        vm.startPrank(writer);
+        assertTrue(intake.complete(a, 0, abi.encode(a, keccak256("a"), _repeat(cap, "a"))));
+        assertTrue(intake.complete(b, 0, abi.encode(b, keccak256("b"), _repeat(cap + 1, "b"))));
+        vm.stopPrank();
+        assertEq(buyer.requestOf(a).uri, _repeat(cap, "a"));
+        assertEq(buyer.requestOf(b).uri, "");
+        assertEq(buyer.requestOf(b).resultHash, keccak256("b"));
+    }
+
+    /// A very long URI is still settled within the 200 000 gas stipend, since it is only emitted.
+    function test_veryLongResultURIStillSettles() public {
+        bytes32 id = _buy(alice);
+        vm.prank(writer);
+        assertTrue(intake.complete(id, 0, abi.encode(id, keccak256("long"), _repeat(4096, "l"))));
+        assertEq(uint8(buyer.requestOf(id).state), uint8(WebsiteBuyer.State.Done));
+    }
+
+    function test_laterNonzeroFailureStatusIsRecorded() public {
+        bytes32 id = _buy(alice);
+        vm.prank(writer);
+        assertTrue(intake.complete(id, 7, abi.encode(id, uint8(7), bytes32("odd"), uint16(0), uint16(0), "")));
+        WebsiteBuyer.Request memory request = buyer.requestOf(id);
+        assertEq(uint8(request.state), uint8(WebsiteBuyer.State.Failed));
+        assertEq(request.status, 7);
+        assertEq(request.reason, bytes32("odd"));
     }
 
     function test_failureWithPanelFieldsAndLongSignatureIsRecordedWithinStipend() public {
@@ -119,7 +155,8 @@ contract WebsiteBuyerEdgesTest is WebsiteBuyerBase {
     function test_failedDeliveryLeavesRequestPendingAndWriterCannotRetry() public {
         bytes32 id = _buy(alice);
         vm.prank(writer);
-        assertFalse(intake.complete(id, 1, abi.encode(id, uint8(7), bytes32("odd"), uint16(0), uint16(0), "")));
+        // Status 0 on the failure path is refused by the contract, so the Intake records it undelivered.
+        assertFalse(intake.complete(id, 1, abi.encode(id, uint8(0), bytes32("odd"), uint16(0), uint16(0), "")));
         assertEq(uint8(buyer.requestOf(id).state), uint8(WebsiteBuyer.State.Pending));
         vm.prank(writer);
         vm.expectRevert(bytes("not pending"));
