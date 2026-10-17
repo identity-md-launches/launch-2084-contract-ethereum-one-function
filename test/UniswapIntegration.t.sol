@@ -13,6 +13,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {WebsiteBuyer} from "../src/WebsiteBuyer.sol";
 import {MockIMD} from "./mocks/MockIMD.sol";
 import {MockIntake} from "./mocks/MockIntake.sol";
@@ -54,6 +55,37 @@ contract LiquiditySeeder is IUnlockCallback {
         } else if (delta > 0) {
             manager.take(currency, address(this), uint256(uint128(delta)));
         }
+    }
+}
+
+/// @dev A searcher that front-runs a purchase with its own ETH to IMD swap on the same pool.
+contract FrontRunner is IUnlockCallback {
+    IPoolManager private immutable manager;
+    PoolKey private key;
+
+    constructor(IPoolManager manager_, PoolKey memory key_) {
+        manager = manager_;
+        key = key_;
+    }
+
+    function swapIn(uint256 amount) external payable {
+        manager.unlock(abi.encode(amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "only manager");
+        uint256 amount = abi.decode(data, (uint256));
+        BalanceDelta delta = manager.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -int256(amount), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            ""
+        );
+        manager.sync(key.currency0);
+        manager.settle{value: uint256(-int256(delta.amount0()))}();
+        manager.take(key.currency1, address(this), uint256(uint128(delta.amount1())));
+        return "";
     }
 }
 
@@ -194,6 +226,35 @@ contract UniswapIntegrationTest is Test {
         }
         assertEq(intake.nonce(), 4);
         assertEq(imd.balanceOf(treasury), 4 * PRICE);
+    }
+
+    function test_realPoolSandwichIsRefusedByBuyerMinimum() public {
+        _liquidity();
+        uint256 snapshot = vm.snapshotState();
+        vm.prank(alice);
+        buyer.buyWebsite{value: 50 ether}("a bakery in Lisbon");
+        uint256 quoted = imd.balanceOf(alice);
+        assertGt(quoted, 40 ether);
+        vm.revertToState(snapshot);
+
+        FrontRunner searcher = new FrontRunner(manager, buyer.poolKey());
+        vm.deal(address(searcher), 2000 ether);
+        searcher.swapIn(2000 ether);
+
+        uint256 minSurplus = quoted * 99 / 100;
+        vm.prank(alice);
+        vm.expectPartialRevert(WebsiteBuyer.SurplusTooLow.selector);
+        buyer.buyWebsiteWithMinimum{value: 50 ether}("a bakery in Lisbon", minSurplus, block.timestamp);
+        assertEq(alice.balance, 100 ether);
+        assertEq(imd.balanceOf(alice), 0);
+        assertEq(imd.balanceOf(treasury), 0);
+        assertEq(intake.nonce(), 0);
+
+        // The one-argument form has no such floor: the same purchase succeeds with a much smaller surplus.
+        vm.prank(alice);
+        buyer.buyWebsite{value: 50 ether}("a bakery in Lisbon");
+        assertLt(imd.balanceOf(alice), minSurplus);
+        _assertClean(alice);
     }
 
     function _liquidity() private {

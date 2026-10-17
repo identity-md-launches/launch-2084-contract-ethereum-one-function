@@ -88,13 +88,51 @@ contract WebsiteCallbacksTest is WebsiteBuyerBase {
         assertEq(buyer.requestOf(id).status, 2);
     }
 
-    function testFuzz_failureRejectsOtherStatusCodes(uint8 status) public {
-        vm.assume(status != 1 && status != 2);
+    function test_failureRejectsStatusZero() public {
         bytes32 id = _buy(alice);
         vm.prank(INTAKE);
-        vm.expectRevert(abi.encodeWithSelector(WebsiteBuyer.InvalidFailureStatus.selector, status));
-        buyer.onIntakeFailure(id, status, bytes32("refused"), 0, 0, "");
+        vm.expectRevert(abi.encodeWithSelector(WebsiteBuyer.InvalidFailureStatus.selector, uint8(0)));
+        buyer.onIntakeFailure(id, 0, bytes32("refused"), 0, 0, "");
         assertEq(uint8(buyer.requestOf(id).state), uint8(WebsiteBuyer.State.Pending));
+    }
+
+    function testFuzz_anyNonzeroFailureStatusIsRecorded(uint8 rawStatus) public {
+        uint8 status = uint8(bound(rawStatus, 1, type(uint8).max));
+        bytes32 id = _buy(alice);
+        vm.expectEmit(true, true, false, true, address(buyer));
+        emit WebsiteFailure(id, alice, status, bytes32("expired"));
+        vm.prank(writer);
+        assertTrue(
+            intake.complete(id, status, abi.encode(id, status, bytes32("expired"), uint16(0), uint16(0), bytes("")))
+        );
+        WebsiteBuyer.Request memory request = buyer.requestOf(id);
+        assertEq(uint8(request.state), uint8(WebsiteBuyer.State.Failed));
+        assertEq(request.status, status);
+        assertEq(request.reason, bytes32("expired"));
+    }
+
+    function test_uriAtStorageLimitIsStored() public {
+        bytes32 id = _buy(alice);
+        string memory uri = _repeat(buyer.MAX_STORED_URI_BYTES(), "u");
+        vm.prank(writer);
+        assertTrue(intake.complete(id, 0, abi.encode(id, keccak256("r"), uri)));
+        assertEq(uint8(buyer.requestOf(id).state), uint8(WebsiteBuyer.State.Done));
+        assertEq(buyer.requestOf(id).uri, uri);
+    }
+
+    function test_longUriStillSettlesWithHashAndIsEmittedNotStored() public {
+        bytes32 id = _buy(alice);
+        string memory uri = _repeat(4096, "u");
+        bytes32 hash = keccak256("r");
+        vm.expectEmit(true, true, false, true, address(buyer));
+        emit WebsiteResult(id, alice, hash, uri);
+        vm.prank(writer);
+        assertTrue(intake.complete(id, 0, abi.encode(id, hash, uri)));
+        WebsiteBuyer.Request memory request = buyer.requestOf(id);
+        assertEq(uint8(request.state), uint8(WebsiteBuyer.State.Done));
+        assertEq(request.resultHash, hash);
+        assertEq(request.uri, "");
+        _assertClean(alice);
     }
 
     function test_intakeMigrationKeepsOldAndNewCallbacksSeparate() public {
@@ -140,7 +178,8 @@ contract WebsiteCallbacksTest is WebsiteBuyerBase {
     function test_missingAndUndeliverableCallbacksDoNotLockFuturePurchases() public {
         bytes32 missing = _buy(alice);
         bytes32 tooLong = _buy(alice);
-        string memory longURI = _repeat(4096, "u");
+        // Emitting 32 KiB costs more log gas than the whole 200 000 gas stipend.
+        string memory longURI = _repeat(32_768, "u");
         vm.prank(writer);
         assertFalse(intake.complete(tooLong, 0, abi.encode(tooLong, keccak256("result"), longURI)));
         assertTrue(intake.requestOf(tooLong).completed);

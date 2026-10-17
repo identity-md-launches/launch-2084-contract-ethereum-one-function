@@ -6,6 +6,17 @@ Buy a hosted one-page website on Ethereum with one payable call:
 bytes32 requestId = websiteBuyer.buyWebsite{value: ethBudget}("a bakery in Lisbon");
 ```
 
+A buyer who wants a bound on the IMD returned uses the protected form of the same purchase:
+
+```solidity
+bytes32 requestId = websiteBuyer.buyWebsiteWithMinimum{value: ethBudget}(words, minSurplus, deadline);
+```
+
+It reverts `SurplusTooLow(surplus, minSurplus)` unless at least `minSurplus` IMD comes back after
+the live price is paid, and `Expired(deadline)` once `block.timestamp > deadline`. That one floor
+covers a sandwich, a stale transaction, and a price raised between quote and inclusion. The
+one-argument `buyWebsite(words)` is the same purchase with `minSurplus = 0` and no deadline.
+
 The buyer needs ETH for the purchase and transaction gas. No IMD balance, token approval,
 registration transaction, or fixed ETH price is needed. Website creation happens asynchronously;
 the swap, payment, request submission, and surplus refund happen atomically in the purchase call.
@@ -13,9 +24,11 @@ the swap, payment, request submission, and surplus refund happen atomically in t
 ## Purchase behavior
 
 1. Validate `words`: 1–1000 **bytes**, excluding `"`, `\`, ASCII controls `0x00`–`0x1f`, and DEL
-   (`0x7f`). Ordinary UTF-8 text is accepted. This is a byte filter, not a complete UTF-8 validator;
-   clients must encode valid UTF-8. `bodyOf(words)` previews the exact request bytes.
-2. Read `intake.priceOf(bytes32("job.open@job-1"), IMD)`. Zero means unavailable. The quoted
+   (`0x7f`), and they must be well-formed UTF-8: no stray or missing continuation bytes, overlong
+   forms, UTF-16 surrogates, or code points above U+10FFFF, so the plane is never sent a body it
+   cannot parse. `bodyOf(words)` previews the exact request bytes.
+2. Read `intake.priceOf(action, IMD)`, where `action` starts as `bytes32("job.open@job-1")` and
+   the owner can move it with `setAction`. Zero means unavailable. The quoted
    0.5 IMD is not hardcoded as the price; the live raw-token amount is used on every purchase.
 3. Unlock the fixed Uniswap v4 PoolManager and perform a native ETH → IMD exact-input swap of
    **all `msg.value`**, using the fixed pool below. There is no WETH wrapping, router, or Permit2.
@@ -68,7 +81,9 @@ hub and account creation bytecode; `accountOf(buyer)` and `AccountOpened` are au
 | Tick spacing | `200` |
 | Hooks | None, `address(0)` |
 | Pool ID | `0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3` |
-| Action | Right-padded UTF-8 `job.open@job-1`, **not its hash** |
+| Initial action | Right-padded UTF-8 `job.open@job-1`, **not its hash**; owner-settable |
+| `MAX_WORDS_BYTES` | `1000` |
+| `MAX_STORED_URI_BYTES` | `128`; longer result URIs are emitted but not stored |
 | Swap price boundary | Uniswap `TickMath.MIN_SQRT_PRICE + 1` (`4295128740`) |
 | Input bound | Positive ETH amount fitting `int128`, as required by v4 deltas |
 
@@ -87,25 +102,28 @@ does not supply `launch.json`, broadcast transactions, or obtain deployment cred
 
 - `buyer`, `intake`, and `price` from the purchase;
 - `state`: `None`, `Pending`, `Done`, or `Failed`;
-- `resultHash` and the full `uri` after a result;
+- `resultHash` and the `uri` after a result (the `uri` is stored when it is at most 128 bytes);
 - `status` and `reason` after a refusal or failure.
 
 The accepting Intake calls `onIntakeResult(bytes32,bytes32,string)` on success, or
-`onIntakeFailure(bytes32,uint8,bytes32,uint16,uint16,bytes)` on refusal (1) or failure without a
-result (2). Both require the original accepting Intake, a known request, and a pending state.
+`onIntakeFailure(bytes32,uint8,bytes32,uint16,uint16,bytes)` on refusal (1), failure without a
+result (2), or any other nonzero status the plane defines later, which is recorded as given.
+Both require the original accepting Intake, a known request, and a pending state.
 Each request settles only once. Unknown requests, replayed callbacks, direct writer calls,
-other senders, and invalid failure status codes revert. Changing `intake` does not change the
+other senders, and a failure status of zero revert. Changing `intake` does not change the
 authority over existing requests. Duplicate request IDs revert new purchases rather than
 overwriting earlier records.
 
-`WebsiteResult` emits the hash and URI, which are also stored. `WebsiteFailure` records and emits
+`WebsiteResult` always emits the hash and the full URI; the state and hash are always stored, and
+the URI is stored too when it fits `MAX_STORED_URI_BYTES`, so a long URI cannot push the callback
+past its gas stipend. `WebsiteFailure` records and emits
 the status and reason. Panel counts and the unused signature parameter are not interpreted.
 The supplied protocol describes these callbacks as unsigned statements of the Intake writer;
 they never authorize a payout or any execution of result data.
 
 The Intake attempts delivery once with 200,000 gas. Tests deliver a normal 78-byte IPFS result
-URI, including storage and event emission, under that stipend. Extremely long URIs can exceed
-it; a lost or reverting callback leaves this contract's record pending. Purchases and account
+URI, a 128-byte stored URI and a 4096-byte emitted-only URI under that stipend. Only a URI of
+tens of kilobytes (whose log alone costs more than the stipend) is lost; a lost or reverting callback leaves this contract's record pending. Purchases and account
 operations never wait on callback completion, and there are no callback-dependent funds to
 unlock. Operators should reconcile against the protocol's `GET /intake/{chainId}/{transactionHash}`
 and result document when delivery fails. Do not infer a refund entitlement from `Pending`.
@@ -152,24 +170,27 @@ plane and still spends that payer's price. Tests explicitly model that distincti
 | --- | --- |
 | Launch service | Deploy `WebsiteBuyer` with the specified owner, verify bytecode and publish the confirmed address/ABI. |
 | Owner | Monitor the Intake version and action availability. Use `setIntake(IIntake)` only for a verified compatible IMD-paying v2 endpoint obtained from IdentityMD's deployment information. Changes are emitted in `IntakeChanged`. |
+| Owner | When IdentityMD retires `job.open@job-1` and prices a newer version at the same Intake, call `setAction(bytes32)` with the new right-padded action id (from the intake-client reference or IdentityMD's deployment information). Changes are emitted in `ActionChanged`; existing payer accounts are kept. |
 | Owner | Use `setPaused(true)` to stop new purchases and `setPaused(false)` to resume. Callbacks and buyer account execution remain available. |
 | Owner | To transfer administration, call `transferOwnership(next)`, then have `next` call `acceptOwnership()`. Setting pending owner to zero cancels the handover. Inherited `renounceOwnership()` permanently removes administration; if paused, purchases then remain paused forever. |
 | Client/operator | Preview and validate the body, quote the real pool, estimate gas (first purchase deploys an account), explain ETH spending and IMD surplus, submit the purchase, and index its request ID and callbacks. |
 | Client/operator | Monitor the result endpoint when callbacks are missing, and validate the served content against `resultHash`. |
 | Release reviewer | Independently review the fund-moving contracts and verify the production dependencies and pool liquidity before enabling public use. |
 
-The only mutable protocol setting is the Intake. IMD, PoolManager, the pool key, action version,
-and website JSON template are deliberately fixed by this task. A protocol change to those fixed
+The mutable protocol settings are the Intake and the action id. IMD, PoolManager, the pool key
+and website JSON template are deliberately fixed by this task (the asset must be the pool's IMD,
+since the swap output is what pays). A protocol change to those fixed
 values needs a new hub; existing payer accounts remain controlled by their buyers. There is no
 asset rescue function or general owner execution function on the hub.
 
 ## Assumptions and limits
 
-- **Execution price:** the only minimum output is the live Intake price. The requested
-  `buyWebsite(string)` interface has no caller-supplied slippage limit or deadline. A trade can
-  succeed at a poor exchange rate, including a sandwich that reduces the surplus to zero.
-  The full ETH budget is swapped; excess ETH is not returned as ETH. Clients should quote
-  conservatively and consider private transaction submission. No oracle is used.
+- **Execution price:** in the one-argument `buyWebsite(string)` the only minimum output is the
+  live Intake price, so a trade can succeed at a poor exchange rate, including a sandwich that
+  reduces the surplus to nearly zero (reproduced on the real v4 pool in
+  `test_realPoolSandwichIsRefusedByBuyerMinimum`). Clients should quote the pool and call
+  `buyWebsiteWithMinimum(words, minSurplus, deadline)` instead, which refuses such a trade.
+  The full ETH budget is swapped; excess ETH is not returned as ETH. No oracle is used.
 - **Dependencies:** this targets the addresses and exact no-hook pool supplied in the assignment.
   Tests execute the pinned real v4 implementation locally with synthetic liquidity and mock IMD
   and Intake; they are not a mainnet fork or a live liquidity/code/treasury verification.
@@ -178,7 +199,10 @@ asset rescue function or general owner execution function on the hub.
 - **Trust:** the owner can redirect future payments to a different Intake or pause all purchases.
   Code presence is checked by `setIntake`, but it cannot prove an endpoint's honesty or ABI.
   The Intake and its writer determine admission, work, delivery, result truth, and payment use.
-  A malicious replacement could collect the approved price without doing the work.
+  A malicious replacement could collect the approved price without doing the work, and a live
+  price raised by the Intake operator or a replaced Intake is paid up to the swap output; a
+  buyer's `minSurplus` bounds that. Pause followed by `renounceOwnership()` leaves purchases
+  paused forever. Run the owner as a multisig and monitor `IntakeChanged` and `ActionChanged`.
 - **Custody:** a normal purchase started from empty balances ends with zero ETH and IMD in the
   hub and no purchase funds or approval in the account. Callbacks retain no funds. Unsolicited
   ERC-20 transfers and forced ETH cannot be prevented by an EVM contract. Such pre-existing hub

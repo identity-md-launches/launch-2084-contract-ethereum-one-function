@@ -4,7 +4,13 @@ The project is compiled with Solidity **0.8.26**, Cancun, optimizer runs 200, an
 Local tests use the assignment's fuzz seed:
 `0x47c3314df5f633c89b34152424c75dd0746ecdfbd9985a406034b3fe476f6e95`.
 
-Final local checks: `forge build` succeeded from a clean cache and empty environment;
+Revision note: the review-driven revision (`buyWebsiteWithMinimum`, `setAction`, UTF-8
+validation, URI storage budget, any nonzero failure status, `WebsiteRevision.t.sol` and the
+real-pool sandwich test) was written on a worker whose shell sandbox could not start any
+process, so it was **not compiled or run locally**; the verifier's `forge build` and
+`forge test` are its first checks. The figures below are from the previously accepted round.
+
+Previous round's local checks: `forge build` succeeded from a clean cache and empty environment;
 `forge test --offline` passed **59 tests in 6 suites**, including 512 cases per fuzz test, with
 that seed and an empty environment; `forge fmt --check` passed. The ordinary `forge test`
 command also passed the full suite. Runtime sizes are 10,426 bytes for `WebsiteBuyer` and
@@ -52,11 +58,13 @@ not evidence of live chain conditions.
   must preserve this protocol. Duplicate IDs are rejected, including across Intake migrations.
 - The callback trust and settlement state remain bound to the original Intake. They cannot be
   reassigned by the owner. Callbacks do not automatically consume or interpret result JSON.
-- The JSON filter has bounded cost and prevents string injection. UTF-8 validity and content
-  acceptance remain client/plane responsibilities. The fixed body carries no owner field.
-- The requested one-argument buying interface only protects a minimum of the live price; it
-  does not bound the ETH/IMD exchange rate beyond that. This MEV exposure, the owner-controlled
-  Intake, nonrefundable job prices, callback loss, and accidental deposits are documented in README.
+- The words filter has bounded cost, prevents string injection, and refuses malformed UTF-8
+  (RFC 3629 lead/continuation ranges). Content acceptance remains the plane's. The fixed body
+  carries no owner field.
+- The requested one-argument buying interface only protects a minimum of the live price; the
+  added `buyWebsiteWithMinimum` bounds the buyer's surplus and the inclusion time. MEV on the
+  one-argument form, the owner-controlled Intake and action, nonrefundable job prices, callback
+  loss, and accidental deposits are documented in README.
 
 Forge's optional linter reports conservative warnings for guarded external calls, explicit numeric
 casts, intentional balance equalities, a bounded validation loop, and the temporary unlock flag.

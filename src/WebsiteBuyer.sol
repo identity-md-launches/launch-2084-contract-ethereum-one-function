@@ -30,8 +30,11 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     bytes32 public constant POOL_ID = 0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3;
     uint24 public constant POOL_FEE = 10_000;
     int24 public constant TICK_SPACING = 200;
+    /// @dev Default action id; the owner can move purchases to a newer version with setAction.
     bytes32 public constant JOB_OPEN = bytes32("job.open@job-1");
     uint256 public constant MAX_WORDS_BYTES = 1000;
+    /// @dev Longer result URIs are emitted but not stored, so the 200 000 gas callback always fits.
+    uint256 public constant MAX_STORED_URI_BYTES = 128;
 
     enum State {
         None,
@@ -62,6 +65,9 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     error DuplicateRequest(bytes32 requestId);
     error NotPending(bytes32 requestId);
     error InvalidFailureStatus(uint8 status);
+    error InvalidAction();
+    error Expired(uint256 deadline);
+    error SurplusTooLow(uint256 surplus, uint256 minSurplus);
 
     event AccountOpened(address indexed buyer, address indexed account);
     event WebsiteRequested(
@@ -77,8 +83,10 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     event WebsiteResult(bytes32 indexed requestId, address indexed buyer, bytes32 resultHash, string uri);
     event WebsiteFailure(bytes32 indexed requestId, address indexed buyer, uint8 status, bytes32 reason);
     event IntakeChanged(address indexed previousIntake, address indexed nextIntake);
+    event ActionChanged(bytes32 indexed previousAction, bytes32 indexed nextAction);
 
     IIntake public intake;
+    bytes32 public action;
     mapping(address buyer => IntakeAccount account) public accountOf;
     mapping(bytes32 requestId => Request request) private _requests;
 
@@ -90,36 +98,77 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     constructor(address owner_) Ownable(owner_) {
         intake = IIntake(INITIAL_INTAKE);
         emit IntakeChanged(address(0), INITIAL_INTAKE);
+        action = JOB_OPEN;
+        emit ActionChanged(bytes32(0), JOB_OPEN);
     }
 
     /// @notice Buy one hosted website. All value is spent swapping ETH; surplus is returned in IMD.
+    /// The only floor is the live price: use buyWebsiteWithMinimum to bound the surplus and time.
     /// @return requestId Intake request identifier used by events, requestOf and callbacks.
     function buyWebsite(string calldata words) external payable nonReentrant whenNotPaused returns (bytes32 requestId) {
+        return _buy(words, 0);
+    }
+
+    /// @notice Same purchase, reverting unless at least minSurplus IMD comes back to the buyer and
+    /// the transaction is mined no later than deadline. Protects against sandwiches, stale
+    /// transactions and a price raised between quote and inclusion.
+    /// @param words The buyer's description of the website.
+    /// @param minSurplus Minimum IMD returned to the buyer after the live price is paid.
+    /// @param deadline Latest block timestamp at which the purchase may execute.
+    /// @return requestId Intake request identifier used by events, requestOf and callbacks.
+    function buyWebsiteWithMinimum(string calldata words, uint256 minSurplus, uint256 deadline)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (bytes32 requestId)
+    {
+        if (block.timestamp > deadline) revert Expired(deadline);
+        return _buy(words, minSurplus);
+    }
+
+    function _buy(string calldata words, uint256 minSurplus) private returns (bytes32 requestId) {
         bytes memory body = bodyOf(words);
         if (msg.value == 0 || msg.value > uint256(uint128(type(int128).max))) revert InvalidETHAmount();
 
         IIntake to = intake;
-        uint256 price = to.priceOf(JOB_OPEN, IMD);
+        uint256 price = to.priceOf(action, IMD);
         if (price == 0) revert ActionNotSold();
 
-        IERC20 token = IERC20(IMD);
-        uint256 beforeSwap = token.balanceOf(address(this));
+        uint256 beforeSwap = IERC20(IMD).balanceOf(address(this));
         _swapAmount = msg.value;
         uint256 received = abi.decode(IPoolManager(POOL_MANAGER).unlock(""), (uint256));
         if (_swapAmount != 0) revert UnexpectedUnlock();
-        if (token.balanceOf(address(this)) != beforeSwap + received) revert UnexpectedTokenBalance();
+        if (IERC20(IMD).balanceOf(address(this)) != beforeSwap + received) revert UnexpectedTokenBalance();
         if (received < price) revert InsufficientIMD(received, price);
+        uint256 surplus = received - price;
+        if (surplus < minSurplus) revert SurplusTooLow(surplus, minSurplus);
 
-        IntakeAccount account = accountOf[msg.sender];
+        IntakeAccount account = _accountFor(msg.sender);
+        requestId = _ask(account, to, body, price);
+
+        if (surplus != 0) IERC20(IMD).safeTransfer(msg.sender, surplus);
+        if (IERC20(IMD).balanceOf(address(this)) != beforeSwap) revert UnexpectedTokenBalance();
+        emit WebsiteRequested(requestId, msg.sender, address(to), address(account), msg.value, received, price, surplus);
+    }
+
+    function _accountFor(address buyer) private returns (IntakeAccount account) {
+        account = accountOf[buyer];
         if (address(account) == address(0)) {
-            account = new IntakeAccount{salt: bytes32(uint256(uint160(msg.sender)))}(msg.sender);
-            accountOf[msg.sender] = account;
-            emit AccountOpened(msg.sender, address(account));
+            account = new IntakeAccount{salt: bytes32(uint256(uint160(buyer)))}(buyer);
+            accountOf[buyer] = account;
+            emit AccountOpened(buyer, address(account));
         }
-        token.safeTransfer(address(account), price);
+    }
+
+    function _ask(IntakeAccount account, IIntake to, bytes memory body, uint256 price)
+        private
+        returns (bytes32 requestId)
+    {
+        IERC20(IMD).safeTransfer(address(account), price);
         requestId = account.ask(
             to,
-            JOB_OPEN,
+            action,
             body,
             IIntake.Callback(address(this), this.onIntakeResult.selector),
             this.onIntakeFailure.selector,
@@ -128,11 +177,6 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
         );
         if (_requests[requestId].state != State.None) revert DuplicateRequest(requestId);
         _requests[requestId] = Request(msg.sender, State.Pending, 0, address(to), price, bytes32(0), bytes32(0), "");
-
-        uint256 surplus = received - price;
-        if (surplus != 0) token.safeTransfer(msg.sender, surplus);
-        if (token.balanceOf(address(this)) != beforeSwap) revert UnexpectedTokenBalance();
-        emit WebsiteRequested(requestId, msg.sender, address(to), address(account), msg.value, received, price, surplus);
     }
 
     /// @dev PoolManager may call this exactly once during this contract's own purchase.
@@ -162,17 +206,60 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     }
 
     /// @notice Exact request body, available for previews before buying. No owner field is sent.
+    /// @dev Words must be well-formed UTF-8 (no overlong forms, surrogates or code points past
+    /// U+10FFFF) with no double quote, backslash or ASCII control byte, so the body is strict JSON.
     function bodyOf(string calldata words) public pure returns (bytes memory) {
-        bytes calldata text = bytes(words);
-        if (text.length == 0 || text.length > MAX_WORDS_BYTES) revert BadWords();
-        for (uint256 i; i < text.length; ++i) {
-            bytes1 c = text[i];
-            if (c < 0x20 || c == 0x7f || c == 0x22 || c == 0x5c) revert BadWords();
+        uint256 n = bytes(words).length;
+        if (n == 0 || n > MAX_WORDS_BYTES) revert BadWords();
+        uint256 i;
+        while (i < n) {
+            uint8 c = uint8(bytes(words)[i]);
+            if (c < 0x80) {
+                if (c < 0x20 || c == 0x7f || c == 0x22 || c == 0x5c) revert BadWords();
+                ++i;
+                continue;
+            }
+            (uint256 extra, uint8 lo, uint8 hi) = _utf8Lead(c);
+            if (n - i <= extra) revert BadWords();
+            c = uint8(bytes(words)[i + 1]);
+            if (c < lo || c > hi) revert BadWords();
+            for (uint256 k = 2; k <= extra; ++k) {
+                c = uint8(bytes(words)[i + k]);
+                if (c < 0x80 || c > 0xbf) revert BadWords();
+            }
+            i += extra + 1;
         }
         return
             abi.encodePacked(
                 '{"objective":"Build a one-page website: ', words, '","skill":"build-website","host":true}'
             );
+    }
+
+    /// @dev Continuation count and allowed range of the byte after a UTF-8 lead byte (RFC 3629).
+    function _utf8Lead(uint8 c) private pure returns (uint256 extra, uint8 lo, uint8 hi) {
+        lo = 0x80;
+        hi = 0xbf;
+        if (c >= 0xc2 && c <= 0xdf) {
+            extra = 1;
+        } else if (c == 0xe0) {
+            extra = 2;
+            lo = 0xa0;
+        } else if (c == 0xed) {
+            extra = 2;
+            hi = 0x9f;
+        } else if (c >= 0xe1 && c <= 0xef) {
+            extra = 2;
+        } else if (c == 0xf0) {
+            extra = 3;
+            lo = 0x90;
+        } else if (c >= 0xf1 && c <= 0xf3) {
+            extra = 3;
+        } else if (c == 0xf4) {
+            extra = 3;
+            hi = 0x8f;
+        } else {
+            revert BadWords();
+        }
     }
 
     function poolKey() public pure returns (PoolKey memory) {
@@ -184,19 +271,22 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
     }
 
     /// @notice Records the Intake writer's result; the hash is not an independent attestation.
+    /// @dev The URI is always emitted; it is stored only up to MAX_STORED_URI_BYTES so that the
+    /// Done state and the hash never depend on the URI's length under the callback's gas stipend.
     function onIntakeResult(bytes32 requestId, bytes32 resultHash, string calldata uri) external {
         Request storage request = _pending(requestId);
         request.state = State.Done;
         request.resultHash = resultHash;
-        request.uri = uri;
+        if (bytes(uri).length <= MAX_STORED_URI_BYTES) request.uri = uri;
         emit WebsiteResult(requestId, request.buyer, resultHash, uri);
     }
 
-    /// @notice Records refusal (1) or failure without result (2). The price has already been spent.
+    /// @notice Records a refusal (1), an end without result (2) or any later nonzero status the
+    /// plane defines. The price has already been spent.
     /// @dev Panel metadata/signatures have no authority in this unsigned website-result protocol.
     function onIntakeFailure(bytes32 requestId, uint8 status, bytes32 reason, uint16, uint16, bytes calldata) external {
         Request storage request = _pending(requestId);
-        if (status != 1 && status != 2) revert InvalidFailureStatus(status);
+        if (status == 0) revert InvalidFailureStatus(status);
         request.state = State.Failed;
         request.status = status;
         request.reason = reason;
@@ -216,6 +306,15 @@ contract WebsiteBuyer is Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallbac
         address previous = address(intake);
         intake = next;
         emit IntakeChanged(previous, address(next));
+    }
+
+    /// @notice Points future purchases at another Intake action id, for example a newer job.open
+    /// version priced at the same Intake. Pending requests are unaffected.
+    function setAction(bytes32 next) external onlyOwner nonReentrant {
+        if (next == bytes32(0)) revert InvalidAction();
+        bytes32 previous = action;
+        action = next;
+        emit ActionChanged(previous, next);
     }
 
     /// @notice Pauses or resumes new purchases. Payer accounts and callbacks remain available.
